@@ -1,0 +1,211 @@
+import os
+import socket
+import string
+import threading
+import sys
+
+from multiprocessing import Process, Pipe
+from threading import Thread
+from time import sleep
+from random import randint
+
+from .tools.messenger import Messenger
+from .tools.tasker import Tasker
+from .tools.controlers import BasicControler
+from .tools.chameleon import Chameleon
+from .tools.handlers import ConnCentral
+from .tools.headers import MrHeader
+from .tools.httpapi import HttpAPI
+
+
+
+class BasicTemplate(Process):
+    def __init__(self, ctrl_pipe: Pipe, conf: dict = {}, http_api: bool = True, messenger: object = Messenger, controlers: object = BasicControler):
+        super().__init__(daemon=True)
+        self._oldConf = conf
+        self.name = conf.get("NAME", self.generateName())
+        self.ip = conf.get("IP", "127.0.0.1")
+        self.port = conf.get("PORT", None)
+        self._portAttempt = 100
+        self.format = conf.get("FORMAT_CODE", "utf-8")
+        self.raw_len = conf.get("RAW_LEN", 2048)
+        self.sockets_dir = conf.get("UNIX_SOCKETS_DIR", os.path.join(os.path.dirname(__file__), "_sockets"))
+        self._accConnTO = conf.get("ACCEPT_CONN_TIMEOUT", 3)
+        self._pauseWork = conf.get("PROC_CYCLE_PAUSE", 2)
+        self.sysHeadears = conf.get("MSG_SYS_HEADERS", MrHeader().generate_name())
+        self.ctrl_pipe = ctrl_pipe
+        self.__CHAM = Chameleon
+        self.Cham = None
+        self.__MSG = messenger
+        self.Msg = None
+        self.__CENTRAL = ConnCentral
+        self.Central = None
+        self.is_listening = False
+        self.working = False
+        self.__TASKER = Tasker
+        self.__CTRL = controlers
+        self.__HTTP = HttpAPI
+        self.Http = None
+        self.httpAddr = None
+        self.Ctrl = None
+        self.Tasker = None
+        self.ready2rebuild = False
+    
+    @property
+    def config(self) -> dict :
+        conf = {
+            "NAME" : self.name,
+            "IP" : self.ip,
+            "PORT" : self.port,
+            "FORMAT_CODE" : self.format,
+            "RAW_LEN" : self.raw_len,
+            "UNIX_SOCKETS_DIR" : self.sockets_dir,
+            "ACCEPT_CONN_TIMEOUT" : self._accConnTO,
+            "PROC_CYCLE_PAUSE" : self._pauseWork,
+            "LISTENING" : self.is_listening,
+            "SYS_MSG_HEADERS" : self.sysHeadears,
+            "HTTP_ADDR" : str(self.httpAddr)
+        }
+        tmp = self._oldConf.copy()
+        tmp.update(conf)      
+        return tmp
+
+    def generateName(self, number: int = 4) -> str:
+        temp = string.ascii_lowercase
+        count = 0
+        text = ""
+        while count < number:
+            char = randint(0, len(temp) -1)
+            text += temp[char]
+            count += 1
+        return text
+    
+    def beforeStart(self) -> None:
+        if not os.path.exists(self.sockets_dir):
+            os.mkdir(self.sockets_dir)
+        self.Tasker = self.__TASKER(self)
+        self.Msg = self.__MSG(self.config, self.Tasker)
+        self.Msg.START()
+        self.Tasker._update()
+
+    
+    ################# Build and Listening ########################################
+    def portAllocation(self) -> bool:
+        count = 0
+        while count < self._portAttempt:
+            self.port = randint(1000, 9999)
+            try:
+                self.server.bind((self.ip, self.port))
+                return True
+            except OSError:
+                count += 1
+                continue
+        return None
+
+    def build(self, first_time : bool = True) -> bool:
+        try:
+            self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        except OSError as error:
+            self.Msg(f"[!!] ERROR: Socket created: {error} [!!]")
+            return False
+
+        if not self.port:
+            if not self.portAllocation():
+                self.Msg("[!!] ERROR: bind socket server. Cant port allocation [!!]")
+                return False
+        else:
+            try:
+                self.port = int(self.port)
+                self.server.bind((self.ip, self.port))
+            except (ValueError, TypeError):
+                self.Msg(f"[!!] ERROR: Wrong port number: {self.port}")
+                return False
+        if first_time:
+            self.Ctrl = self.__CTRL(self.ctrl_pipe, self)
+            self.Tasker.addTask(name=self.Ctrl.name, func_name=self.Ctrl.START, info="Server Command Controler")
+            self.Cham = self.__CHAM(self.format)
+            self.Http = self.__HTTP(self)
+            self.Tasker.addTask(name="HTTP SERVER", func_name=self.Http.START, info="Http Server Thread")
+            sleep(0.5)
+            self.httpAddr = f"{self.ip}:{self.Http.port}"
+            self.Msg(f"Server created successfull. Address: {self.ip}:{self.port}")
+        else:
+            self.Msg("Socket rebuild successfull")
+        
+        self.working = True
+        self.ready2rebuild = False
+        return True
+    
+    def _listening(self) -> None:
+        self.server.listen()
+        self.is_listening = True
+        self.server.settimeout(self._accConnTO)
+        self.Central = self.__CENTRAL(self, self.Msg, self.Cham)
+        self.Msg("Server start listening ... waiting for connection ....")
+        while self.is_listening:
+            try:
+                conn, addr = self.server.accept()
+                self._accept_conn(conn, addr)
+            except socket.timeout:
+                continue
+        self.Msg("Server stop listening")
+        self.server.close()
+        self.ready2rebuild = True
+        self.Central = None
+        return
+    
+    def listening(self) -> None:
+        if self.is_listening:
+            self.Msg("Server already listening")
+            return
+        self.Tasker.addTask(name="Listening TH", func_name=self._listening, info="Accept Connection Threading", is_daemon=False)
+    
+    def stopListening(self) -> None:
+        if not self.is_listening:
+            self.Msg("Server not listening")
+            return
+        self.Msg("Preapre to disconnecting clients and stop listening .....")
+        self.is_listening = False
+
+
+
+    
+    def _accept_conn(self, conn : object, addr: object):
+        client = self.Central.addClient(conn, addr)
+        self.acceptConn(client)
+    
+    def acceptConn(self, client: object) -> None:
+        pass
+    
+
+
+
+
+    ################################ OTHERS ###########################################
+    def workCycle(self) -> None:
+        if self.ready2rebuild:
+            self.build(False)
+        if self.Central:
+            self.Central.clear()
+        self.Tasker.cleaner()
+
+        
+    def turnOFF(self) -> None:
+        self.working = False
+
+    def run(self) -> None:
+        self.beforeStart()
+        if self.build():
+            while self.working:
+                self.workCycle()
+                sleep(self._pauseWork)
+        self.Msg("Server Closed")
+        sys.exit()
+
+        
+        
+            
+
+        
+
